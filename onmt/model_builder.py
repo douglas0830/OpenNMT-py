@@ -10,13 +10,15 @@ from torch.nn.init import xavier_uniform_
 import onmt.inputters as inputters
 import onmt.modules
 from onmt.encoders.rnn_encoder import RNNEncoder
+from onmt.encoders.lm_encoder import LMRNNEncoder
 from onmt.encoders.transformer import TransformerEncoder
 from onmt.encoders.cnn_encoder import CNNEncoder
 from onmt.encoders.mean_encoder import MeanEncoder
 from onmt.encoders.audio_encoder import AudioEncoder
-from onmt.encoders.image_encoder import ImageEncoder
+#from onmt.encoders.image_encoder import ImageEncoder
 
 from onmt.decoders.decoder import InputFeedRNNDecoder, StdRNNDecoder
+from onmt.decoders.lm_decoder import LMInputFeedRNNDecoder
 from onmt.decoders.transformer import TransformerDecoder
 from onmt.decoders.cnn_decoder import CNNDecoder
 
@@ -60,13 +62,18 @@ def build_embeddings(opt, word_dict, feature_dicts, for_encoder=True):
                       sparse=opt.optim == "sparseadam")
 
 
-def build_encoder(opt, embeddings):
+def build_encoder(opt, embeddings, encoder_type = None):
     """
     Various encoder dispatcher function.
     Args:
         opt: the option in current environment.
         embeddings (Embeddings): vocab embeddings for this encoder.
     """
+    if encoder_type == "lm":
+        # "rnn" or "brnn"
+        return LMRNNEncoder(opt.rnn_type, opt.brnn, opt.enc_layers,
+                          opt.rnn_size, opt.dropout, embeddings,
+                          opt.bridge)
     if opt.encoder_type == "transformer":
         return TransformerEncoder(opt.enc_layers, opt.rnn_size,
                                   opt.heads, opt.transformer_ff,
@@ -84,13 +91,24 @@ def build_encoder(opt, embeddings):
                           opt.bridge)
 
 
-def build_decoder(opt, embeddings):
+def build_decoder(opt, embeddings, decoder_type = None):
     """
     Various decoder dispatcher function.
     Args:
         opt: the option in current environment.
         embeddings (Embeddings): vocab embeddings for this decoder.
     """
+    if decoder_type=="lm":
+        return LMInputFeedRNNDecoder(opt.rnn_type, opt.brnn,
+                                   opt.dec_layers, opt.rnn_size,
+                                   opt.global_attention,
+                                   opt.global_attention_function,
+                                   opt.coverage_attn,
+                                   opt.context_gate,
+                                   opt.copy_attn,
+                                   opt.dropout,
+                                   embeddings,
+                                   opt.reuse_copy_attn)
     if opt.decoder_type == "transformer":
         return TransformerDecoder(opt.dec_layers, opt.rnn_size,
                                   opt.heads, opt.transformer_ff,
@@ -141,10 +159,12 @@ def load_test_model(opt, dummy_opt, model_path=None):
     model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint)
     model.eval()
     model.generator.eval()
+    model.lm_encoder.eval()#FIXME
+    model.lm_decoder.eval()
     return fields, model, model_opt
 
 
-def build_base_model(model_opt, fields, gpu, checkpoint=None):
+def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint=None):
     """
     Args:
         model_opt: the option loaded from checkpoint.
@@ -202,8 +222,29 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
 
     # Build NMTModel(= encoder + decoder).
     device = torch.device("cuda" if gpu else "cpu")
-    model = onmt.models.NMTModel(encoder, decoder)
-    model.model_type = model_opt.model_type
+  
+    if True:
+    #if fuse_lm_checkpoint is not None:
+        src_dict = fields["src"].vocab
+        feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
+        lm_src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
+        lm_encoder = build_encoder(model_opt, lm_src_embeddings, "lm")
+        tgt_dict = fields["tgt"].vocab
+        feature_dicts = inputters.collect_feature_vocabs(fields, 'tgt')
+        tgt_embeddings = build_embeddings(model_opt, tgt_dict,
+                                      feature_dicts, for_encoder=False)
+        lm_decoder = build_decoder(model_opt, tgt_embeddings, "lm")
+        model = onmt.models.LMNMTModel(encoder, decoder, lm_encoder, lm_decoder, model_opt.rnn_size)
+        model.lm_encoder = lm_encoder
+        model.lm_decoder = lm_decoder
+        for param in model.lm_encoder.parameters():
+            param.requires_grad=False
+        for param in model.lm_decoder.parameters():
+            param.requires_grad=False
+        model.model_type = model_opt.model_type
+    else:
+        model = onmt.models.NMTModel(encoder, decoder)
+        model.model_type = model_opt.model_type
 
     # Build Generator.
     if not model_opt.copy_attn:
@@ -222,7 +263,12 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
 
     # Load the model states from checkpoint or initialize them.
     if checkpoint is not None:
-        model.load_state_dict(checkpoint['model'])
+        load_model_dict = {k:v for k,v in checkpoint['model'].items() if 'lm' not in k}
+       
+        model_dict = model.state_dict()
+        model_dict.update(load_model_dict)
+       
+        model.load_state_dict(model_dict)#checkpoint['model'])
         generator.load_state_dict(checkpoint['generator'])
     else:
         if model_opt.param_init != 0.0:
@@ -244,6 +290,11 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         if hasattr(model.decoder, 'embeddings'):
             model.decoder.embeddings.load_pretrained_vectors(
                 model_opt.pre_word_vecs_dec, model_opt.fix_word_vecs_dec)
+    if fuse_lm_checkpoint is not None:
+        lm_encoder_model_dict = {k[8:]:v for k, v in fuse_lm_checkpoint['model'].items() if 'encoder' in k}
+        lm_decoder_model_dict = {k[8:]:v for k, v in fuse_lm_checkpoint['model'].items() if 'decoder' in k}
+        model.lm_encoder.load_state_dict(lm_encoder_model_dict)
+        model.lm_decoder.load_state_dict(lm_decoder_model_dict)
 
     # Add generator to model (this registers it as parameter of model).
     model.generator = generator
@@ -252,10 +303,10 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
     return model
 
 
-def build_model(model_opt, opt, fields, checkpoint):
+def build_model(model_opt, opt, fields, checkpoint, fuse_lm_checkpoint=None):
     """ Build the Model """
     logger.info('Building model...')
     model = build_base_model(model_opt, fields,
-                             use_gpu(opt), checkpoint)
+                             use_gpu(opt), checkpoint, fuse_lm_checkpoint=fuse_lm_checkpoint)
     logger.info(model)
     return model

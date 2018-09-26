@@ -290,6 +290,9 @@ def train_opts(parser):
                        help="""If training from a checkpoint then this is the
                        path to the pretrained model's state_dict.""")
 
+    group.add_argument('-lm_fusion', default='', type=str,
+                       help="""If training from a checkpoint then this is the
+                       path to the pretrained model's state_dict.""")
     # Pretrained word vectors
     group.add_argument('-pre_word_vecs_enc',
                        help="""If a valid path is specified, then this will load

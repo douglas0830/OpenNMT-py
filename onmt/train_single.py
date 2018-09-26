@@ -86,6 +86,16 @@ def main(opt):
     else:
         checkpoint = None
         model_opt = opt
+   
+    if opt.lm_fusion:
+        logger.info('Loading language model checkpoint from %s' % opt.lm_fusion)
+        fuse_lm_checkpoint = torch.load(opt.lm_fusion,
+                                map_location=lambda storage, loc: storage)
+    else:
+        fuse_lm_checkpoint = None
+   
+    
+    
 
     # Peek the first dataset to determine the data_type.
     # (All datasets have the same data_type).
@@ -106,7 +116,7 @@ def main(opt):
                     % (j, len(fields[feat].vocab)))
 
     # Build model.
-    model = build_model(model_opt, opt, fields, checkpoint)
+    model = build_model(model_opt, opt, fields, checkpoint, fuse_lm_checkpoint=fuse_lm_checkpoint)
     n_params, enc, dec = _tally_parameters(model)
     logger.info('encoder: %d' % enc)
     logger.info('decoder: %d' % dec)

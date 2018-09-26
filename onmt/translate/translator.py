@@ -552,6 +552,10 @@ class Translator(object):
         dec_states = self.model.decoder.init_decoder_state(
             src, memory_bank, enc_states)
 
+        lm_enc_states, lm_memory_bank = self.model.lm_encoder(src, src_lengths)
+        lm_dec_states = self.model.lm_decoder.init_decoder_state(
+            src, lm_memory_bank, lm_enc_states)
+
         if src_lengths is None:
             assert not isinstance(memory_bank, tuple), \
                 'Ensemble decoding only supported for text data'
@@ -568,6 +572,12 @@ class Translator(object):
             memory_bank = rvar(memory_bank.data)
         memory_lengths = src_lengths.repeat(beam_size)
         dec_states.repeat_beam_size_times(beam_size)
+
+        if isinstance(lm_memory_bank, tuple):
+            lm_memory_bank = tuple(rvar(x.data) for x in lm_memory_bank)
+        else:
+            lm_memory_bank = rvar(lm_memory_bank.data)
+        lm_dec_states.repeat_beam_size_times(beam_size)
 
         # (3) run the decoder to generate sentences, using beam search.
         for i in range(self.max_length):
@@ -596,6 +606,18 @@ class Translator(object):
                 step=i)
 
             dec_out = dec_out.squeeze(0)
+
+            lm_dec_out, lm_dec_states, lm_attn = self.model.lm_decoder(
+                inp, lm_memory_bank, lm_dec_states,
+                memory_lengths=memory_lengths,
+                step=i)
+
+            lm_dec_out = lm_dec_out.squeeze(0)
+
+            dec_state_concat = torch.cat([dec_out, lm_dec_out], 1)
+            weight1 = self.model.linear_out1(dec_state_concat)
+            weight2 = self.model.linear_out2(dec_state_concat)
+            dec_out = weight1*dec_out + weight2*lm_dec_out
 
             # dec_out: beam x rnn_size
 
