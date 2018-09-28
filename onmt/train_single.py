@@ -94,8 +94,14 @@ def main(opt):
     else:
         fuse_lm_checkpoint = None
    
-    
-    
+    '''if opt.lm_bias:
+        logger.info('Loading out language model checkpoint from %s' % opt.lm_out)
+        lm_out_checkpoint = torch.load(opt.lm_out,
+                                map_location=lambda storage, loc: storage)
+        lm_in_checkpoint = torch.load(opt.lm_in,
+                                map_location=lambda storage, loc: storage)
+    else:
+        lm_out_checkpoint = lm_in_checkpoint = None'''
 
     # Peek the first dataset to determine the data_type.
     # (All datasets have the same data_type).

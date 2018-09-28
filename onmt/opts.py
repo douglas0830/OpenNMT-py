@@ -54,12 +54,12 @@ def model_opts(parser):
                        Options are [text|img|audio].""")
 
     group.add_argument('-encoder_type', type=str, default='rnn',
-                       choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn'],
+                       choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn', 'lm'],
                        help="""Type of encoder layer to use. Non-RNN layers
                        are experimental. Options are
                        [rnn|brnn|mean|transformer|cnn].""")
     group.add_argument('-decoder_type', type=str, default='rnn',
-                       choices=['rnn', 'transformer', 'cnn'],
+                       choices=['rnn', 'transformer', 'cnn', 'lm'],
                        help="""Type of decoder layer to use. Non-RNN layers
                        are experimental. Options are
                        [rnn|transformer|cnn].""")
@@ -132,6 +132,7 @@ def model_opts(parser):
                        help='Train a coverage attention layer.')
     group.add_argument('-lambda_coverage', type=float, default=1,
                        help='Lambda value for coverage.')
+
 
 
 def preprocess_opts(parser):
@@ -275,6 +276,13 @@ def train_opts(parser):
     group.add_argument('-seed', type=int, default=-1,
                        help="""Random seed used for the experiments
                        reproducibility.""")
+
+    group.add_argument('-lm_guide', action="store_true",
+                       help='When available, train to copy.')
+    group.add_argument('-lm_out', default="",
+                       help="Source directory for image or audio files.")
+    group.add_argument('-lm_in', default="",
+                       help="Source directory for image or audio files.")
 
     # Init options
     group = parser.add_argument_group('Initialization')
@@ -443,6 +451,12 @@ def translate_opts(parser):
                        help='Path to model .pt file(s). '
                             'Multiple models can be specified, '
                             'for ensemble decoding.')
+    group.add_argument('-lm_bias', action="store_true",
+                       help='When available, train to copy.')
+    group.add_argument('-lm_out', default="",
+                       help="Source directory for image or audio files.")
+    group.add_argument('-lm_in', default="",
+                       help="Source directory for image or audio files.")
 
     group = parser.add_argument_group('Data')
     group.add_argument('-data_type', default="text",

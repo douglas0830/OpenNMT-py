@@ -152,16 +152,165 @@ def load_test_model(opt, dummy_opt, model_path=None):
     fields = inputters.load_fields_from_vocab(
         checkpoint['vocab'], data_type=opt.data_type)
 
+    fuse_lm_checkpoint = torch.load("mono_en_input_feed_step_100000.pt",
+                            map_location=lambda storage, loc: storage)
     model_opt = checkpoint['opt']
     for arg in dummy_opt:
         if arg not in model_opt:
             model_opt.__dict__[arg] = dummy_opt[arg]
-    model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint)
+    model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint, fuse_lm_checkpoint=fuse_lm_checkpoint)
     model.eval()
     model.generator.eval()
     model.lm_encoder.eval()#FIXME
     model.lm_decoder.eval()
     return fields, model, model_opt
+
+def load_lm_bias_test_model(opt, dummy_opt, model_path=None):
+    if model_path is None:
+        model_path = opt.models[0]
+    checkpoint = torch.load(model_path,
+                            map_location=lambda storage, loc: storage)
+    fields = inputters.load_fields_from_vocab(
+        checkpoint['vocab'], data_type=opt.data_type)
+
+    model_opt = checkpoint['opt']
+    for arg in dummy_opt:
+        if arg not in model_opt:
+            model_opt.__dict__[arg] = dummy_opt[arg]
+
+    model_path = opt.lm_out
+    lm_out_checkpoint = torch.load(model_path,
+                            map_location=lambda storage, loc: storage)
+
+    model_path = opt.lm_in
+    lm_in_checkpoint = torch.load(model_path,
+                            map_location=lambda storage, loc: storage)
+
+
+    model = build_lm_bias_base_model(model_opt, fields, use_gpu(opt), checkpoint, lm_out_checkpoint, lm_in_checkpoint)
+
+    model.eval()
+    model.generator.eval()
+
+    model.lm_out.eval()
+    model.lm_out.generator.eval()
+
+    model.lm_in.eval()
+    model.lm_in.generator.eval()
+
+    return fields, model, model_opt
+
+def build_lm_bias_base_model(model_opt, fields, gpu, checkpoint=None, lm_out_checkpoint=None, lm_in_checkpoint=None):
+    """
+    Args:
+        model_opt: the option loaded from checkpoint.
+        fields: `Field` objects for the model.
+        gpu(bool): whether to use gpu.
+        checkpoint: the model gnerated by train phase, or a resumed snapshot
+                    model from a stopped training.
+    Returns:
+        the NMTModel.
+    """
+    assert model_opt.model_type in ["text"], \
+        ("Unsupported model type %s" % (model_opt.model_type))
+
+    # Build encoder.
+    if model_opt.model_type == "text":
+        src_dict = fields["src"].vocab
+        feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
+        src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
+        lm_out_src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
+        lm_in_src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
+        encoder = build_encoder(model_opt, src_embeddings)
+        lm_out_encoder = build_encoder(model_opt, lm_out_src_embeddings, "lm")
+        lm_in_encoder = build_encoder(model_opt, lm_in_src_embeddings, "lm")
+
+    # Build decoder.
+    tgt_dict = fields["tgt"].vocab
+    feature_dicts = inputters.collect_feature_vocabs(fields, 'tgt')
+    tgt_embeddings = build_embeddings(model_opt, tgt_dict,
+                                      feature_dicts, for_encoder=False)
+    lm_out_tgt_embeddings = build_embeddings(model_opt, tgt_dict,
+                                      feature_dicts, for_encoder=False)
+    lm_in_tgt_embeddings = build_embeddings(model_opt, tgt_dict,
+                                      feature_dicts, for_encoder=False)
+
+    # Share the embedding matrix - preprocess with share_vocab required.
+    if model_opt.share_embeddings:
+        # src/tgt vocab should be the same if `-share_vocab` is specified.
+        if src_dict != tgt_dict:
+            raise AssertionError('The `-share_vocab` should be set during '
+                                 'preprocess if you use share_embeddings!')
+
+        tgt_embeddings.word_lut.weight = src_embeddings.word_lut.weight
+
+    decoder = build_decoder(model_opt, tgt_embeddings)
+    lm_out_decoder = build_decoder(model_opt, lm_out_tgt_embeddings, "lm")
+    lm_in_decoder = build_decoder(model_opt, lm_in_tgt_embeddings, "lm")
+
+    # Build NMTModel(= encoder + decoder).
+    device = torch.device("cuda" if gpu else "cpu")
+  
+    model = onmt.models.NMTModel(encoder, decoder)
+    lm_out_model = onmt.models.LMModel(lm_out_encoder, lm_out_decoder)
+    lm_out_model.model_type = model_opt.model_type
+    lm_in_model = onmt.models.LMModel(lm_in_encoder, lm_in_decoder)
+    lm_in_model.model_type = model_opt.model_type
+    
+    model.model_type = model_opt.model_type
+
+    # Build Generator.
+    if not model_opt.copy_attn:
+        if model_opt.generator_function == "sparsemax":
+            gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+        else:
+            gen_func = nn.LogSoftmax(dim=-1)
+        generator = nn.Sequential(
+            nn.Linear(model_opt.rnn_size, len(fields["tgt"].vocab)), gen_func
+        )
+        if model_opt.share_decoder_embeddings:
+            generator[0].weight = decoder.embeddings.word_lut.weight
+        lm_out_generator = nn.Sequential(
+            nn.Linear(model_opt.rnn_size, len(fields["tgt"].vocab)), gen_func
+        )
+        lm_in_generator = nn.Sequential(
+            nn.Linear(model_opt.rnn_size, len(fields["tgt"].vocab)), gen_func
+        )
+    else:
+        generator = CopyGenerator(model_opt.rnn_size,
+                                  fields["tgt"].vocab)
+
+    # Load the model states from checkpoint or initialize them.
+    if checkpoint is not None:
+        #load_model_dict = {k:v for k,v in checkpoint['model'].items() if 'lm' not in k}
+       
+        #model_dict = model.state_dict()
+        #model_dict.update(load_model_dict)
+       
+        model.load_state_dict(checkpoint['model'])
+        generator.load_state_dict(checkpoint['generator'])
+        print(checkpoint.keys())
+        print(lm_out_checkpoint.keys())
+        lm_out_model.load_state_dict(lm_out_checkpoint['model'])
+        lm_out_generator.load_state_dict(lm_out_checkpoint['generator'])
+        lm_in_model.load_state_dict(lm_in_checkpoint['model'])
+        lm_in_generator.load_state_dict(lm_in_checkpoint['generator'])
+
+
+    # Add generator to model (this registers it as parameter of model).
+    model.generator = generator
+    model.lm_out = lm_out_model
+    model.lm_in = lm_in_model
+    model.lm_out.generator = lm_out_generator
+    model.lm_in.generator = lm_in_generator
+
+    for param in model.lm_out.parameters():
+        param.requires_grad=False
+    for param in model.lm_in.parameters():
+        param.requires_grad=False
+
+    model.to(device)
+    return model
 
 
 def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint=None):
@@ -183,7 +332,10 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint
         src_dict = fields["src"].vocab
         feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
         src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
-        encoder = build_encoder(model_opt, src_embeddings)
+        if model_opt.encoder_type == "lm":
+            encoder = build_encoder(model_opt, src_embeddings, "lm")
+        else:
+            encoder = build_encoder(model_opt, src_embeddings)
     elif model_opt.model_type == "img":
         if ("image_channel_size" not in model_opt.__dict__):
             image_channel_size = 3
@@ -218,33 +370,40 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint
 
         tgt_embeddings.word_lut.weight = src_embeddings.word_lut.weight
 
-    decoder = build_decoder(model_opt, tgt_embeddings)
+    if model_opt.encoder_type == "lm":
+        decoder = build_decoder(model_opt, tgt_embeddings, "lm")
+    else:
+        decoder = build_decoder(model_opt, tgt_embeddings)
 
     # Build NMTModel(= encoder + decoder).
     device = torch.device("cuda" if gpu else "cpu")
   
-    if True:
-    #if fuse_lm_checkpoint is not None:
-        src_dict = fields["src"].vocab
-        feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
-        lm_src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
-        lm_encoder = build_encoder(model_opt, lm_src_embeddings, "lm")
-        tgt_dict = fields["tgt"].vocab
-        feature_dicts = inputters.collect_feature_vocabs(fields, 'tgt')
-        tgt_embeddings = build_embeddings(model_opt, tgt_dict,
-                                      feature_dicts, for_encoder=False)
-        lm_decoder = build_decoder(model_opt, tgt_embeddings, "lm")
-        model = onmt.models.LMNMTModel(encoder, decoder, lm_encoder, lm_decoder, model_opt.rnn_size)
-        model.lm_encoder = lm_encoder
-        model.lm_decoder = lm_decoder
-        for param in model.lm_encoder.parameters():
-            param.requires_grad=False
-        for param in model.lm_decoder.parameters():
-            param.requires_grad=False
+    if model_opt.encoder_type == "lm":
+        model = onmt.models.LMModel(encoder, decoder)
         model.model_type = model_opt.model_type
     else:
-        model = onmt.models.NMTModel(encoder, decoder)
-        model.model_type = model_opt.model_type
+        if True:
+        #if fuse_lm_checkpoint is not None:
+            src_dict = fields["src"].vocab
+            feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
+            lm_src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
+            lm_encoder = build_encoder(model_opt, lm_src_embeddings, "lm")
+            tgt_dict = fields["tgt"].vocab
+            feature_dicts = inputters.collect_feature_vocabs(fields, 'tgt')
+            tgt_embeddings = build_embeddings(model_opt, tgt_dict,
+                                          feature_dicts, for_encoder=False)
+            lm_decoder = build_decoder(model_opt, tgt_embeddings, "lm")
+            model = onmt.models.LMNMTModel(encoder, decoder, lm_encoder, lm_decoder, model_opt.rnn_size)
+            model.lm_encoder = lm_encoder
+            model.lm_decoder = lm_decoder
+            for param in model.lm_encoder.parameters():
+                param.requires_grad=False
+            for param in model.lm_decoder.parameters():
+                param.requires_grad=False
+            model.model_type = model_opt.model_type
+        else:
+            model = onmt.models.NMTModel(encoder, decoder)
+            model.model_type = model_opt.model_type
 
     # Build Generator.
     if not model_opt.copy_attn:
@@ -270,6 +429,8 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint
        
         model.load_state_dict(model_dict)#checkpoint['model'])
         generator.load_state_dict(checkpoint['generator'])
+        print(checkpoint['model'].keys())
+        print(checkpoint['model']['lm_decoder.rnn.layers.0.bias_ih'])
     else:
         if model_opt.param_init != 0.0:
             for p in model.parameters():
@@ -293,7 +454,10 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, fuse_lm_checkpoint
     if fuse_lm_checkpoint is not None:
         lm_encoder_model_dict = {k[8:]:v for k, v in fuse_lm_checkpoint['model'].items() if 'encoder' in k}
         lm_decoder_model_dict = {k[8:]:v for k, v in fuse_lm_checkpoint['model'].items() if 'decoder' in k}
+        print(lm_encoder_model_dict.keys())
         model.lm_encoder.load_state_dict(lm_encoder_model_dict)
+        print(lm_decoder_model_dict.keys())
+        print(lm_decoder_model_dict['rnn.layers.0.bias_ih'])
         model.lm_decoder.load_state_dict(lm_decoder_model_dict)
 
     # Add generator to model (this registers it as parameter of model).

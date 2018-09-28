@@ -162,6 +162,7 @@ class LMRNNDecoderBase(nn.Module):
             if self.bidirectional_encoder:
                 hidden = torch.cat([hidden[0:hidden.size(0):2],
                                     hidden[1:hidden.size(0):2]], 2)
+            hidden = torch.zeros_like(hidden)
             return hidden
 
         if isinstance(encoder_final, tuple):  # LSTM

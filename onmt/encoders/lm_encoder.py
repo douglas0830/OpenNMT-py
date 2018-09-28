@@ -63,6 +63,14 @@ class LMRNNEncoder(EncoderBase):
 
         memory_bank, encoder_final = self.rnn(packed_emb)
 
+        #memory_bank = torch.zeros_like(memory_bank)
+        #print(encoder_final)
+        #encoder_final = torch.zeros_like(encoder_final)
+        l = []
+        for t in encoder_final:
+            l.append(torch.zeros_like(t))
+        encoder_final = tuple(l)
+
         if lengths is not None and not self.no_pack_padded_seq:
             memory_bank = unpack(memory_bank)[0]
 
